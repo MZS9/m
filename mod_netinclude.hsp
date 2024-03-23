@@ -1,0 +1,1128 @@
+/* /////////////////////////////////////////////////////////////////////////////
+
+#netincludeモジュール
+--------------------------------------------------------------------------------
+%dll ; モジュール名 
+mod_netinclude
+%ver ; バージョン 
+4.1
+%date ; 更新日 
+2024/3/3
+%author ; 著作者 
+MIZUSHIKI
+
+*/ /////////////////////////////////////////////////////////////////////////////
+#ifndef __mod_netinclude__
+#define __mod_netinclude__
+
+;メインスクリプト内の #netinclude しか認識しません。
+#ifdef _debug
+
+;デバッグ時のみ #netinclude 処理を実行
+#define netinclude(%1,%2=0,%3=0,%4=0) addition %1*
+#define netuselib(%1,%2=0) uselib %1
+
+#module mod_netinclude
+
+#uselib "hspext.dll"
+#func fxren fxren 5
+#if __hspver__ < 14081  ; 0x3701未満
+#func pipeexec pipeexec 5
+#else
+#func pipeexec pipeexec $202
+#endif
+#func pipeget pipeget $83
+#func dirlist2 dirlist2 5
+#func dirlist2h dirlist2h 0
+#uselib "hspinet.dll"
+#func netinit netinit 0
+#func netexec netexec 1
+#func neturl neturl 6
+#func netrequest netrequest 6
+#func netfileinfo netfileinfo $202
+#func netgetv netgetv $202
+#func netrequest_get netrequest_get $202
+#func urlencode urlencode $202
+#func nkfcnv nkfcnv $202
+#cfunc netgetv_requestsize "_netgetv_requestsize@0"	// 受信サイズ
+#uselib "kernel32.dll"
+#func GetCommandLine "GetCommandLineA"
+#uselib "shlwapi.dll"
+#func global PathIsDirectory "PathIsDirectoryA" sptr
+#define NETMOD_PHPFILE "https://timetag.main.jp/HSP3NetModules/netmod.php"
+
+// 実行
+#deffunc execute@mod_netinclude
+	// initialize
+	_startregexp  ; モジュール内mod_regexp.as初期化
+
+	// #addition(#include) の右側は「%c exist %1」とか繋げても一切反応しないから hsptmp を読みに行く。(命令が成立すると右側が無視される) 
+	// ただし、VSCode等の外部エディタではhsptmpが作られないのでaxファイルからファイル名読み出しを試みる。(外部モジュール内で__file__を使ってもそのモジュールのファイル名しか出せない)
+	dupptr hsp3exeCommandLine, GetCommandLine(), 1024, 2
+	if strmid(hsp3exeCommandLine,-1,3) == "obj"{
+		hsptmpFile = "hsptmp"
+	}else{
+		hsptmpFile = ""
+		axFile = submatch(hsp3exeCommandLine,"^\".*?\" \"?(.+?)[\"$]")
+		exist axFile
+		if strsize > 32 {  ; 少なくともファイルヘッダのmax_dsまでを持つ
+			sdim buf, 32
+			bload axFile, buf, 32, 0
+			if lpeek(buf, 0) == 0x33505348 {  ; HSP3
+				size = lpeek(buf, 28)  ; max_ds
+				index = lpeek(buf, 24)  ; pt_ds
+				sdim buf, size
+				bload axFile, buf, size, index : index = 0
+				repeat
+					if index >= size : break
+					dupptr _buf, varptr(buf) + index, 2, 2 : index += strlen(_buf) + 1  ; 一文字列読み込んだ。次のindexを指しておく
+					if getpath(_buf,18) != ".hsp" : continue  ; Data Segment(文字列などの固定データ)の中で最初に出てきた.\*.hsp(またはdir_cur+\*.hsp)が実行開始スクリプトファイルではないかと推測
+					if wpeek(_buf) != 0x5C2E && getpath(_buf,32) != dir_cur+"\\" : continue
+					hsptmpFile = _buf
+					break
+				loop
+				sdim buf  ; メモリ解放
+			}
+		}
+	}
+	if hsptmpFile != "" {
+		notesel hsptmpBuf
+		noteload hsptmpFile
+		noteunsel
+	}
+	// netuselib
+	matches uselibResult, hsptmpBuf, "#netuselib\\s*\"(net/|https?)?(.+?)(!/.+?)?\"\\s*,?\\s*(\\w*)"
+	numUselibResult = stat
+	// uselibResult 内の配列もフラグとして活用する
+	repeat numUselibResult
+		uselibResult.cnt.0 = "0"  ; ダウンロードしないフラグを立てておく
+		downloadFolder = ""  ; 初期値はカレントフォルダ
+		if (instr(uselibResult.cnt.4, 0, "g") != -1) || (instr(uselibResult.cnt.4, 0, "G") != -1) : downloadFolder = dir_exe+"\\common\\"
+		// 所定位置(カレントディレクトリまたはdir_exe)にdllが既に置いてあれば何もしない
+		if downloadFolder == "" {
+			exist dir_cur + "\\" + getpath(uselibResult.cnt.2 + uselibResult.cnt.3, 8)
+		}else {
+			exist dir_exe + "\\" + getpath(uselibResult.cnt.2 + uselibResult.cnt.3, 8)
+		}
+		if strsize == -1 {
+			exist downloadFolder + uselibResult.cnt.1 + uselibResult.cnt.2 + uselibResult.cnt.3  ; ファイルの存在を確認。ダウンロード済みなら何もしない
+			if strsize == -1 {  ; uselibResult.cnt.0=ダウンロードフラグ / numCommon, numCurrent ;カウント
+				uselibResult.cnt.0 = ""  ; "0"を消してダウンロードするフラグにする
+				// common,currentが入り乱れててもそれぞれ塊に出来るようにuselibResult.cnt.4に識別番号を入れている
+				if downloadFolder == "" {
+					uselibResult.cnt.4 = "1"
+					numCurrent++  ; currentにダウンロードする数
+				}else {
+					uselibResult.cnt.4 = "2"
+					numCommon++  ; commonにダウンロードする数
+				}
+				if netinited == 0 {
+					netinited = 1
+					netinit  ; ここでhspinetの初期化をしてしまう
+					if stat != 0 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+				}
+			}else {
+				// ファイルはダウンロード済みなのに所定位置にdllが置いてない状態なのでコピーする
+				if downloadFolder == "" {
+					bcopy downloadFolder + uselibResult.cnt.1 + uselibResult.cnt.2 + uselibResult.cnt.3, dir_cur + "\\" + getpath(uselibResult.cnt.2 + uselibResult.cnt.3, 8)
+				}else {
+					bcopy downloadFolder + uselibResult.cnt.1 + uselibResult.cnt.2 + uselibResult.cnt.3, dir_exe + "\\" + getpath(uselibResult.cnt.2 + uselibResult.cnt.3, 8)
+				}
+			}
+		}
+	loop
+	// netinclude
+	matches includeResult, hsptmpBuf, "#netinclude\\s*\"(net/|https?)?(.+?)(!/.+?)?\"\\s*/\\s*,?\\s*(\\w*)(?:\n)?\\s*;*/*(?:\\s*,\\s*\"(.*?)\")?(?:\\s*,\\s*\"(.*?)\")?"
+	numIncludeResult = stat
+	// 以下、includeResult 内の配列もフラグとして活用する
+	repeat numIncludeResult
+		includeResult.cnt.0 = "0"  ; ダウンロードしないフラグを立てておく
+		downloadFolder = ""  ; 初期値はカレントフォルダ
+		if (instr(includeResult.cnt.4, 0, "g") != -1) || (instr(includeResult.cnt.4, 0, "G") != -1) : downloadFolder = dir_exe+"\\common\\"
+		exist downloadFolder + includeResult.cnt.1 + includeResult.cnt.2 + includeResult.cnt.3  ; ファイルの存在を確認。ダウンロード済みなら何もしない
+		if strsize == -1 {  ; includeResult.cnt.0=ダウンロードフラグ / numCommon, numCurrent ;カウント
+			includeResult.cnt.0 = ""  ; "0"を消してダウンロードするフラグにする
+			// common,currentが入り乱れててもそれぞれ塊に出来るようにincludeResult.cnt.4に識別番号を入れている
+			if downloadFolder == "" {
+				includeResult.cnt.4 = "1"
+				numCurrent++  ; currentにダウンロードする数
+			}else {
+				includeResult.cnt.4 = "2"
+				numCommon++  ; commonにダウンロードする数
+			}
+			if netinited == 0 {
+				netinited = 1
+				netinit  ; ここでhspinetの初期化をしてしまう
+				if stat != 0 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+			}
+		}
+	loop
+	if numCurrent + numCommon {  ; common,currentのどちらかにダウンロードする
+		modulesCurrent = ""
+		modulesCommon = ""
+		falesComment = ""
+		repeat 2, 1
+			__cnt = cnt  ; cnt==1のときcurrentを処理。cnt==2のときcommonを処理
+			// netuselib
+			repeat numUselibResult
+				if uselibResult.cnt.0 = "0" { continue }  ; ダウンロードしないフラグ
+				if uselibResult.cnt.4 != ""+__cnt { continue }  ; currentとcommonの振り分け
+				if uselibResult.cnt.1 == "net/" {  ; 登録されているモジュールデータを扱う
+					if hasNetmodData == 0 {  ; 登録データを取得
+						hasNetmodData = 1
+						neturl NETMOD_PHPFILE + "?req=data"
+						netfileinfo info, ""
+						if vartype(info) == 4 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+						netrequest_get ""
+						do : wait 5 : netexec res : until res
+						netgetv buf  ; 受信データ
+						matches netmodData, buf, "^(.*?)\t(.*?)$"  ; 配列に入れ直す
+						numNetmodData = stat
+					}
+					uselibResult.cnt.0 = "0"  ; 一旦ダウンロードしないフラグを立てて登録データ内に該当モジュールが存在するか確認
+					_cnt = cnt
+					repeat numNetmodData
+						if getpath(netmodData.cnt.1,16) == getpath(uselibResult._cnt.2,16) {  ; モジュールがあった。
+							uselibResult._cnt.0 = netmodData.cnt.2  ; uselibResult.cnt.0にGitHubリポジトリ名。
+							uselibResult._cnt.2 = submatch(netmodData.cnt.1, "^(.+?)(?:!/.+?)?$")  ; 登録データの "～.dll" or "～.zip" まで
+							uselibResult._cnt.3 = submatch(netmodData.cnt.1, "^.+?(!/.+?)?$")  ; 登録データが "～.zip!/～.dll" だった場合に "!/～.dll" 部分
+							break
+						}
+					loop
+					if uselibResult.cnt.0 == "0" {  ; モジュールが無かった
+						falesComment += "\n>net/" + uselibResult.cnt.2 + uselibResult.cnt.3
+						continue
+					}
+					if __cnt == 1 {
+						modulesCurrent += ">net/" + uselibResult.cnt.2 + uselibResult.cnt.3 + "  [" + uselibResult.cnt.0 + "]\n"  ; ダウンロード予定のデータ
+					}else {
+						modulesCommon += ">net/" + uselibResult.cnt.2 + uselibResult.cnt.3 + "  [" + uselibResult.cnt.0 + "]\n"  ; ダウンロード予定のデータ
+					}
+				}else{  ; リポジトリ込みで指定されているか、httpダウンロードか
+					if __cnt == 1 {
+						modulesCurrent += ">" + uselibResult.cnt.1 + uselibResult.cnt.2 + uselibResult.cnt.3 + "\n"  ; ダウンロード予定のデータ
+					}else {
+						modulesCommon += ">" + uselibResult.cnt.1 + uselibResult.cnt.2 + uselibResult.cnt.3 + "\n"  ; ダウンロード予定のデータ
+					}
+					moduleUrl = uselibResult.cnt.1 + uselibResult.cnt.2 + uselibResult.cnt.3
+					if instr(moduleUrl, 0, "://") != -1 || instr(moduleUrl, 0, "?") != -1 {
+						falesComment += "\n>" + uselibResult.cnt.1 + uselibResult.cnt.2 + uselibResult.cnt.3
+					}
+				}
+			loop
+			// netinclude
+			repeat numIncludeResult
+				if includeResult.cnt.0 = "0" { continue }  ; ダウンロードしないフラグ
+				if includeResult.cnt.4 != ""+__cnt { continue }  ; currentとcommonの振り分け
+				if includeResult.cnt.1 == "net/" {  ; 登録されているモジュールデータを扱う
+					if hasNetmodData == 0 {  ; 登録データを取得
+						hasNetmodData = 1
+						neturl NETMOD_PHPFILE + "?req=data"
+						netfileinfo info, ""
+						if vartype(info) == 4 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+						netrequest_get ""
+						do : wait 5 : netexec res : until res
+						netgetv buf  ; 受信データ
+						matches netmodData, buf, "^(.*?)\t(.*?)$"  ; 配列に入れ直す
+						numNetmodData = stat
+					}
+					includeResult.cnt.0 = "0"  ; 一旦ダウンロードしないフラグを立てて登録データ内に該当モジュールが存在するか確認
+					_cnt = cnt
+					repeat numNetmodData
+						if getpath(netmodData.cnt.1,16) == getpath(includeResult._cnt.2,16) {  ; モジュールがあった。
+							includeResult._cnt.0 = netmodData.cnt.2  ; includeResult.cnt.0にGitHubリポジトリ名。
+							includeResult._cnt.2 = submatch(netmodData.cnt.1, "^(.+?)(?:!/.+?)?$")  ; 登録データの "～.hsp" or "～.zip" まで
+							includeResult._cnt.3 = submatch(netmodData.cnt.1, "^.+?(!/.+?)?$")  ; 登録データが "～.zip!/～.hsp" だった場合に "!/～.hsp" 部分
+							break
+						}
+					loop
+					if includeResult.cnt.0 == "0" {  ; モジュールが無かった
+						falesComment += "\n>net/" + includeResult.cnt.2 + includeResult.cnt.3
+						continue
+					}
+					if __cnt == 1 {
+						modulesCurrent += ">net/" + includeResult.cnt.2 + includeResult.cnt.3 + "  [" + includeResult.cnt.0 + "]\n"  ; ダウンロード予定のデータ
+					}else {
+						modulesCommon += ">net/" + includeResult.cnt.2 + includeResult.cnt.3 + "  [" + includeResult.cnt.0 + "]\n"  ; ダウンロード予定のデータ
+					}
+				}else{  ; リポジトリ込みで指定されているか、httpダウンロードか
+					if __cnt == 1 {
+						modulesCurrent += ">" + includeResult.cnt.1 + includeResult.cnt.2 + includeResult.cnt.3 + "\n"  ; ダウンロード予定のデータ
+					}else {
+						modulesCommon += ">" + includeResult.cnt.1 + includeResult.cnt.2 + includeResult.cnt.3 + "\n"  ; ダウンロード予定のデータ
+					}
+					moduleUrl = includeResult.cnt.1 + includeResult.cnt.2 + includeResult.cnt.3
+					if instr(moduleUrl, 0, "://") != -1 || instr(moduleUrl, 0, "?") != -1 {
+						falesComment += "\n>" + includeResult.cnt.1 + includeResult.cnt.2 + includeResult.cnt.3
+					}
+				}
+			loop
+		loop
+		if modulesCurrent + modulesCommon == "" {
+			dialog "モジュールデータが見つかりませんでした\n" + falesComment, 1, "#netinclude" : end
+		}
+		if falesComment != "" {
+			dialog "\"モジュール名文字列\"に使用できない文字が含まれています。\n下記文字列があれば修正してください。\n[ :// ⇒ / , ? ⇒ ？(大文字) ]\n" + falesComment, 1, "#netinclude" : end
+		}
+		modulesAll = ""
+		if modulesCommon != "" {
+			modulesAll += dir_exe + "\\common\\\n\nに\n\n" + modulesCommon
+			if modulesCurrent != "" {
+				modulesAll += "\nをダウンロード、\n-----\n\n"
+			}
+		}
+		if modulesCurrent != "" {
+			modulesAll += dir_cur + "\n\nに\n\n" + modulesCurrent
+		}
+		dialog modulesAll + "\nをダウンロードします。", 2, "#netinclude"
+		if stat == 6 {
+			currentDirectory = dir_cur
+			falesComment = ""
+			; ==この時点で========= [登録データ  ] ========= [リポジトリ込み指定   ] == [ネット上から切り出し ] ================== ;
+			; uselibResult.cnt.0 = "0" or "netmod_REPOS" or ""                      or ""                                         ;
+			; uselibResult.cnt.1 =        "net/"         or ""                      or "https?"                                   ;
+			; uselibResult.cnt.2 =        "ModName.hsp"  or "REPOS/FLD/ModName.hsp" or "/url/dir#/ModName.hsp"                    ;
+			; uselibResult.cnt.3 = (.2が ZippedFile.zip のとき) "!/FLD/ModName.hsp"                                               ;
+			; uselibResult.cnt.4 = "1" or "2" (globalキーワードの有無)                                                            ;
+			; ==================================================================================================================== ;
+			repeat numUselibResult
+				if uselibResult.cnt.0 == "0" { continue }
+				if uselibResult.cnt.4 == "2" { chdir dir_exe+"\\common\\" }
+				httpsUrl = uselibResult.cnt.1 + ":/"  ; http(s):/ を作っておく (「ネット上から切り出し」の場合に必要)
+				uselibResult.cnt.0 += uselibResult.cnt.2  ; ダウンロード元URL
+				uselibResult.cnt.0 = replace(uselibResult.cnt.0, "^(.+?/.+?/)raw/(.+)$", "$1$2")  ; ダウンロード元が https://github.com/USER/REPOS/raw/～ なら raw/ を削って raw.githubusercontent で行けるようにする
+				uselibResult.cnt.1 += uselibResult.cnt.2  ; ダウンロード先フォルダ+ファイル名(zipなら～.zipまで)
+				if strmid(uselibResult.cnt.1, 0, 4) != "http" {  ; http(s)以外のときはGitHubの生データURLを指定 (「ネット上から切り出し」以外の場合)
+					httpsUrl = "https://raw.githubusercontent.com/"
+				}
+				split uselibResult.cnt.1, "/", dirs  ; URL(ディレクトリ)構造分解
+				repeat stat-1  ; 深い階層を作っていく
+					dirlist i, dirs.cnt, 5  ; フォルダ存在確認
+					if stat == 0 { mkdir dirs.cnt }  ; フォルダが存在しないなら作る
+					chdir dirs.cnt  ; カレントディレクトリを1階層深くに移動
+				loop
+				url = replace(replace(httpsUrl + uselibResult.cnt.0, "#.*$", ""), "？", "?")  ; ～.dllのurl。zip混みの場合は～.zipまで
+				if uselibResult.cnt.3 == "" {
+					// 通常のdllファイル (http等の階層をフォルダに落とし込んで一旦そこに保存)
+					neturl url  ; ダウンロード
+					netfileinfo info, ""
+					if vartype(info) == 4 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+					if instr(info, 0, "404 Not Found") == -1 {
+						netrequest_get ""
+						do : wait 5 : netexec res : until res
+					}else {
+						res = -1
+					}
+					if res < 0 {  ; netexecからのエラー
+						falesComment += "\n>" + uselibResult.cnt.0
+					}else {
+						netgetv buf  ; 受信データ
+						dllName = getpath(uselibResult.cnt.0, 8)
+						bsave dllName, buf, netgetv_requestsize()
+						// カレントディレクトリ(またはdir_exe)にdllが必要になるのでコピーする (一旦保存した物もそこに残す)
+						if uselibResult.cnt.4 != "2" {
+							bcopy dllName, currentDirectory + "\\" + dllName
+						}else {
+							bcopy dllName, dir_exe + "\\" + dllName
+						}
+					}
+				}else {
+					// zip
+					// もし今回の取得で既にzipをダウンロード展開済みだったときは処理を飛ばす
+					PathIsDirectory dir_cur + "\\" + getpath(uselibResult.cnt.0, 8) + "!"
+					if stat == 0 {
+						Downloader url, dir_cur
+						downloadedZipFilePath = refstr
+						exist downloadedZipFilePath
+						if strsize != -1 {
+							Unzipper downloadedZipFilePath, dir_cur
+							unzippedFolderName = getpath(refstr, 8)
+							fxren unzippedFolderName, getpath(uselibResult.cnt.0, 8) + "!"
+							delete downloadedZipFilePath
+						}
+					}
+					// 再度、ダウンロード展開できたか確認
+					PathIsDirectory dir_cur + "\\" + getpath(uselibResult.cnt.0, 8) + "!"
+					if stat != 0 {
+						chdir getpath(uselibResult.cnt.0, 8) + "!"
+						// カレントディレクトリ(またはdir_exe)にdllが必要になるのでコピーする (unzipした物もそこに残す)
+						exist strmid(uselibResult.cnt.3, 2, strlen(uselibResult.cnt.3))
+						if strsize != -1 {
+							if uselibResult.cnt.4 != "2" {
+								bcopy strmid(uselibResult.cnt.3, 2, strlen(uselibResult.cnt.3)), currentDirectory + "\\" + getpath(uselibResult.cnt.3, 8)
+							}else {
+								bcopy strmid(uselibResult.cnt.3, 2, strlen(uselibResult.cnt.3)), dir_exe + "\\" + getpath(uselibResult.cnt.3, 8)
+							}
+						}else {
+							falesComment += "\n>" + uselibResult.cnt.0 + includeResult.cnt.3 + "  [zip内でファイルを見つけられず]"
+						}
+					}else {
+						falesComment += "\n>" + uselibResult.cnt.0 + includeResult.cnt.3 + "  [ダウンロード失敗]"
+					}
+				}
+				chdir currentDirectory  ; 深い階層まで潜っていたのでカレントディレクトリに戻す
+			loop
+			; ==この時点で========= [登録データ  ] ========= [リポジトリ込み指定   ] == [ネット上から切り出し ] ================== ;
+			; includeResult.cnt.0 = "0" or "netmod_REPOS" or ""                      or ""                                         ;
+			; includeResult.cnt.1 =        "net/"         or ""                      or "https?"                                   ;
+			; includeResult.cnt.2 =        "ModName.hsp"  or "REPOS/FLD/ModName.hsp" or "/url/dir#/ModName.hsp"                    ;
+			; includeResult.cnt.3 = (.2が ZippedFile.zip のとき) "!/FLD/ModName.hsp"                                               ;
+			; includeResult.cnt.4 = "1" or "2" (globalキーワードの有無)                                                            ;
+			; includeResult.cnt.5 =                                              ""  or "正規表現文字列"                           ;
+			; includeResult.cnt.6 =                                              ""  or NKF変換/HTMLデコード オプション            ;
+			; ==================================================================================================================== ;
+			repeat numIncludeResult
+				if includeResult.cnt.0 == "0" { continue }
+				if includeResult.cnt.4 == "2" { chdir dir_exe+"\\common\\" }
+				httpsUrl = includeResult.cnt.1 + ":/"  ; http(s):/ を作っておく (「ネット上から切り出し」の場合に必要)
+				includeResult.cnt.0 += includeResult.cnt.2  ; ダウンロード元URL
+				includeResult.cnt.0 = replace(includeResult.cnt.0, "^(.+?/.+?/)raw/(.+)$", "$1$2")  ; ダウンロード元が https://github.com/USER/REPOS/raw/～ なら raw/ を削って raw.githubusercontent で行けるようにする
+				includeResult.cnt.1 += includeResult.cnt.2  ; ダウンロード先フォルダ+ファイル名(zipなら～.zipまで)
+				if strmid(includeResult.cnt.1, 0, 4) != "http" {  ; http(s)以外のときはGitHubの生データURLを指定 (「ネット上から切り出し」以外の場合)
+					httpsUrl = "https://raw.githubusercontent.com/"
+				}
+				split includeResult.cnt.1, "/", dirs  ; URL(ディレクトリ)構造分解
+				repeat stat-1  ; 深い階層を作っていく
+					dirlist i, dirs.cnt, 5  ; フォルダ存在確認
+					if stat == 0 { mkdir dirs.cnt }  ; フォルダが存在しないなら作る
+					chdir dirs.cnt  ; カレントディレクトリを1階層深くに移動
+				loop
+
+				url = replace(replace(httpsUrl + includeResult.cnt.0, "#.*$", ""), "？", "?")  ; ～.dllのurl。zip混みの場合は～.zipまで
+				if includeResult.cnt.3 == "" {
+					// 通常のhspファイル (http等の階層をフォルダに落とし込んで一旦そこに保存)
+					neturl url  ; ダウンロード
+					netfileinfo info, ""
+					if vartype(info) == 4 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+					if instr(info, 0, "404 Not Found") == -1 {
+						netrequest_get ""
+						do : wait 5 : netexec res : until res
+					}else {
+						res = -1
+					}
+					if res < 0 {  ; netexecからのエラー
+						falesComment += "\n>" + includeResult.cnt.0
+					}else {
+						netgetv buf  ; 受信データ
+						if includeResult.cnt.6 != ""{
+							nkfcnv buf, buf, includeResult.cnt.6, , stat*2  ; NKF変換/HTMLデコード オプションがあれば変換する [予防のため最大バッファを受信サイズの倍にしておく]
+						}
+						matches dummy, buf, "\\n"  ; (LFかもしれない)改行の数を取得 [変換後のサイズを計算するため]
+						nkfcnv buf, buf, "Lw", , strlen(buf) + stat  ; 改行コードLFをCR+LFに変換する
+						if includeResult.cnt.5 != "" {
+							buf = submatch(buf, includeResult.cnt.5, , 1)  ; ネットのページの一部からモジュールを切り出したいときの正規表現
+						}
+						hspName = getpath(includeResult.cnt.0, 8)
+						notesel buf
+						notesave hspName
+						noteunsel
+						if instr(includeResult.cnt.6, 0, "D") != -1 { ;どうしてもHTMLエンティティをデコードしたかったのでD隠しコマンドでpowershellを利用してHTMLデコード。ついでに<br>も改行化
+							hspPath = dir_cur + "/" + hspName
+							exec "powershell \"Add-Type -AssemblyName System.Web;$s=Get-Content '" + hspPath + "' -Raw;$t=$s.Replace('<br>',\\\"`r`n\\\") -replace ‘<(\\\"[^\\\"]*\\\"|''[^'']*''|[^''\\\">])*>’,'';$d=[System.Web.HttpUtility]::HtmlDecode($t);Set-Content -Path '" + hspPath + "' $d;\"", 2
+						}
+					}
+				}else {
+					// zip
+					// もし今回の取得で既にzipをダウンロード展開済みだったときは処理を飛ばす
+					PathIsDirectory dir_cur + "\\" + getpath(includeResult.cnt.0, 8) + "!"
+					if stat == 0 {
+						Downloader url, dir_cur
+						downloadedZipFilePath = refstr
+						exist downloadedZipFilePath
+						if strsize != -1 {
+							Unzipper downloadedZipFilePath, dir_cur
+							unzippedFolderName = getpath(refstr, 8)
+							fxren unzippedFolderName, getpath(includeResult.cnt.0, 8) + "!"
+							delete downloadedZipFilePath
+						}
+					}
+					// 再度、ダウンロード展開できたか確認
+					PathIsDirectory dir_cur + "\\" + getpath(includeResult.cnt.0, 8) + "!"
+					if stat == 0 {
+						falesComment += "\n>" + includeResult.cnt.0 + includeResult.cnt.3 + "  [zipダウンロード失敗]"
+					}
+				}
+				chdir currentDirectory  ; 深い階層まで潜っていたのでカレントディレクトリに戻す
+			loop
+			if falesComment != ""{
+				dialog "ダウンロード失敗\n"+falesComment, 1, "#netinclude" : end
+			}
+			dialog "ダウンロード完了。\n再実行してください", 0, "#netinclude" : end  ; ダウンロードしたら再実行実行
+		}
+	}
+	sdim hsptmpBuf  ; メモリ解放
+	return
+
+// (ローカル命令)ファイルダウンロード
+#deffunc local Downloader str loadUrl, str folderPath_downloads
+	if inited_pipeBuf == 0 {
+		inited_pipeBuf = 1
+		sdim pipe_ln, 64000
+		sdim pipe_buf, 512000
+		ginfoNewid = ginfo_newid
+		bgscr ginfoNewid, 1, 1, 2 : sysfont 17 : mes "%"
+		ginfoMesy = ginfo_mesy
+	}
+	CreateProgress "Download", getpath(loadUrl,8)
+	// ファイルサイズ取得
+	fileSize = 0
+	neturl getpath(loadUrl,32)
+	netfileinfo info, getpath(loadUrl,8)
+	if vartype(info) == 4 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+	if instr(info, 0, "404 Not Found") != -1 : HideProgress : return ""
+	if stat == 0 : fileSize = int(submatch(info,"Content-Length: (\\d*)\n"))
+	if fileSize == 0 : fileSize = 1  ; 0割りを防ぐため
+	
+	dirCur = dir_cur
+	chdir folderPath_downloads
+	// ファイルダウンロード
+	netrequest getpath(loadUrl,8)
+	do
+		wait 10 : netexec res
+		exist getpath(loadUrl,8)
+		UpdateProgress limitf(1.0*strsize/(1.0*fileSize/100), 0.0, 100.0)
+	until res  ; ダウンロードループ
+	chdir dirCur
+	HideProgress
+	return folderPath_downloads + "\\" + getpath(loadUrl,8)
+
+// (ローカル命令)zipファイル展開
+#deffunc local Unzipper str zipFilePath, str folderPath_unzip
+	if inited_pipeBuf == 0 {
+		inited_pipeBuf = 1
+		sdim pipe_ln, 64000
+		sdim pipe_buf, 512000
+		ginfoNewid = ginfo_newid
+		bgscr ginfoNewid, 1, 1, 2 : sysfont 17 : mes "%"
+		ginfoMesy = ginfo_mesy
+	}
+	CreateProgress "Unzip", getpath(zipFilePath,8)
+	// 展開後ファイル数を取得
+	cmd = "cmd /c powershell \"add-type -assemblyname system.io.compression.filesystem;[io.compression.zipfile]::openread('"+zipFilePath+"').entries | ft length\""
+	pipe_buf = "" : pipe_ln = ""
+	pipeexec pipe_buf, cmd
+	do : wait 1 : pipeget pipe_ln : until stat==0
+
+	index = 0
+	getstr dummy, pipe_buf, index : index += strsize
+	getstr dummy, pipe_buf, index : index += strsize
+	getstr dummy, pipe_buf, index : index += strsize
+	pipe_buf = strmid(pipe_buf, index, strlen(pipe_buf))
+	strrep pipe_buf, " ", ""
+	dirStrLength = strlen(pipe_buf)
+
+	// 展開後のトップのフォルダ名を取得
+	cmd = "cmd /c powershell \"add-type -assemblyname system.io.compression.filesystem;[io.compression.zipfile]::openread('"+zipFilePath+"').entries | ft -a fullname\""
+	pipe_buf = "" : pipe_ln = ""
+	pipeexec pipe_buf, cmd
+	do : wait 1 : pipeget pipe_ln : until stat==0
+	index = 0
+	getstr dummy, pipe_buf, index : index += strsize
+	getstr dummy, pipe_buf, index : index += strsize
+	getstr dummy, pipe_buf, index : index += strsize
+	pipe_buf = strmid(pipe_buf, index, strlen(pipe_buf))
+	pipe_buf = strtrim(pipe_buf, 1)
+	topFolderName_unzip = submatch(pipe_buf,"^(.+?)/")
+	
+	pathSupport = ""
+	if strlen(folderPath_unzip) == 2 : pathSupport = "\\"  ; ドライブ直下C:\とかだとC:で来ているので必要なとき足す
+
+	// 展開するzipがトップフォルダ１つだけ存在するものかどうか確認
+	checkOneTopFolder = match(pipe_buf, "^(?!"+topFolderName_unzip+"/).+$")
+	if peek(checkOneTopFolder) == 0x0D : poke checkOneTopFolder, 0, 0  ; 何故か 0x0D だけ吸ってくるみたい(?)なので
+	if peek(checkOneTopFolder) == 0x0A : poke checkOneTopFolder, 0, 0
+	if topFolderName_unzip == "" || checkOneTopFolder != "" {
+		// 違った場合tempフォルダを作ってそこに展開する
+		pathSupport = "\\temp"
+		topFolderName_unzip = "temp"
+	}
+
+	// 実際に展開
+	pipe_buf = "" : pipe_ln = ""
+	cmd = "cmd /c powershell \"Expand-Archive -Path '"+zipFilePath+"' -DestinationPath '"+folderPath_unzip + pathSupport+"'\" -Force"
+	pipeexec pipe_buf, cmd
+	// 展開開始されるまで待機
+	repeat
+		wait 75
+		PathIsDirectory folderPath_unzip+"\\"+topFolderName_unzip
+		if stat != 0 : break
+	loop
+	// 展開を確認してからchdir
+	dirCur = dir_cur
+	chdir folderPath_unzip + "\\" + topFolderName_unzip
+	dirlist2h 4
+	mref refs,65
+	do : wait 100
+		dirlist2 d2size, "*", 1
+		UpdateProgress limitf(1.0*d2size/(1.0*dirStrLength/100),0.0,100.0)
+		pipeget pipe_ln
+	until stat==0
+	chdir dirCur
+	HideProgress
+	return folderPath_unzip + "\\" + topFolderName_unzip
+
+// (ローカル命令)進捗バー作成
+#deffunc local CreateProgress str action, str fileName
+	progressAction = action
+	progressFileName = fileName
+	ginfoSel = ginfo_sel
+	bgscr ginfoNewid, 300, ginfoMesy*3, 2, (ginfo_dispx-300)/2, (ginfo_dispy*90/100-ginfoMesy*3)/2
+	sysfont 17 : mes strf("%s %s - %s", progressAction, progressFileName, "準備中...")
+	syscolor 4 : boxf : color 250,250,250 : boxf 4, 4, ginfo_sx-4, ginfo_sy-4 : color 20,20,20
+	pos (ginfo_sx-ginfo_mesx)/2, (ginfo_sy-ginfo_mesy)/2 : mes strf("%s %s - %s", progressAction, progressFileName, "準備中...")
+	gsel ginfoNewid, 2 : gsel ginfoSel
+	return
+// (ローカル命令)進捗バー更新
+#deffunc local UpdateProgress double perDouble
+	ginfoSel = ginfo_sel
+	gsel ginfoNewid : redraw 0
+	mes strf("%s %s - % 3.1f %%", progressAction, progressFileName, perDouble)
+	syscolor 4 : boxf :	color 250,250,250 : boxf 4, 4, ginfo_sx-4, ginfo_sy-4
+	syscolor 15 : boxf 4, 4, 4+(ginfo_sx-8)*(perDouble*10)/1000, ginfo_sy-4 : color 20,20,20
+	pos (ginfo_sx-ginfo_mesx)/2, (ginfo_sy-ginfo_mesy)/2 : mes strf("%s %s - % 3.1f %%", progressAction, progressFileName, perDouble)
+	redraw 1 : gsel ginfoSel
+	return
+// (ローカル命令)進捗バー非表示
+#deffunc local HideProgress
+	ginfoSel = ginfo_sel
+	gsel ginfoNewid, -1
+	gsel ginfoSel
+	return
+
+// HSP3NetModulesデータベースに登録されているモジュール情報を表示
+#deffunc netinclude_GetData
+	netinit  ; hspinetの初期化
+	neturl NETMOD_PHPFILE + "?req=data"
+	netfileinfo info, ""
+	if vartype(info) == 4 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+	netrequest_get ""
+	repeat
+		netexec res  ; 結果待ちのためのループ
+		if res{break}
+		await 50
+	loop
+	netgetv buf  ; 受信データを代入
+	screen ginfo(25)
+	title "#netinclude - netinclude_GetData"
+	mesbox buf, ginfo_sx, ginfo_sy, 12
+	stop
+	return
+
+// HSP3NetModulesデータベースにモジュール情報を登録
+#deffunc netinclude_PostModule str p1
+	p1_ = p1
+	urlencode ep1, p1_
+	netinit  ; hspinetの初期化
+	neturl NETMOD_PHPFILE + "?req=post&hsp="+ep1
+	netfileinfo info, ""
+	if vartype(info) == 4 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+	netrequest_get ""
+	repeat
+		netexec res  ; 結果待ちのためのループ
+		if res{break}
+		await 50
+	loop
+	netgetv buf  ; 受信データを代入
+	screen ginfo(25)
+	title "#netinclude - netinclude_PostModule"
+	if strmid( buf, 0, 7 ) = "false: " {
+		getstr errorMessage, buf, 7, ';'
+		switch errorMessage
+		case "not_found__datafile"
+			buf+="\n\nデータファイルが見つかりませんでした。（HSP3NetModules管理者に問い合わせください。）"
+			swbreak
+		case "not_found__module_file"
+			buf+="\n\nGitHub内で指定されたモジュールを見つけることができませんでした。"
+			swbreak
+		case "bad__request"
+			buf+="\n\nリクエスト文字列が正しくありません。（HSP3NetModules管理者に問い合わせください。）"
+			swbreak
+		case "bad__module_name"
+			buf+="\n\nモジュール名に登録できない文字が入っています。(または、拡張子に.hsp/.asが使われていません。)"
+			swbreak
+		case "arledy__module_name"
+			buf+="\n\nすでにそのモジュール名は登録されています。モジュール名を変更して登録してください。"
+			swbreak
+		case "failure__update"
+			buf+="\n\nアップデートに失敗しました。"
+		swend
+	}
+	mesbox buf, ginfo_sx, ginfo_sy, 12
+	stop
+	return
+
+// HSP3NetModulesデータベースからモジュール情報を削除
+#deffunc netinclude_DeleteModule str p1
+	p1_ = p1
+	urlencode ep1, p1_
+	netinit  ; hspinetの初期化
+	neturl NETMOD_PHPFILE + "?req=delete&hsp="+ep1
+	netfileinfo info, ""
+	if vartype(info) == 4 : dialog "ネット接続できませんでした", 1, "#netinclude" : end
+	netrequest_get ""
+	repeat
+		netexec res  ; 結果待ちのためのループ
+		if res{break}
+		await 50
+	loop
+	netgetv buf  ; 受信データを代入
+	screen ginfo(25)
+	title "#netinclude - netinclude_DeleteModule"
+	if strmid( buf, 0, 7 ) = "false: " {
+		getstr errorMessage, buf, 7, ';'
+		switch errorMessage
+		case "not_found__datafile"
+			buf+="\n\nデータファイルが見つかりませんでした。（HSP3NetModules管理者に問い合わせください。）"
+			swbreak
+		case "found__module_file"
+			buf+="\n\nモジュールファイルが見つかりました。netinclueデータから削除したい場合はモジュールファイルをGitHubから削除する必要があります。"
+			swbreak
+		case "bad__request"
+			buf+="\n\nリクエスト文字列が正しくありません。（HSP3NetModules管理者に問い合わせください。）"
+			swbreak
+		case "bad__module_name"
+			buf+="\n\nモジュール名に登録できない文字が入っています。"
+			swbreak
+		case "not_found__module_name"
+			buf+="\n\nデータファイルの中に指定されたモジュール名が見つかりませんでした。"
+			swbreak
+		case "bad__github_access"
+			buf+="\n\nデータの特殊削除をしようとしましたが、GitHubのアクセスまたは情報の取得に失敗しました。"
+			swbreak
+		swend
+	}
+	mesbox buf, ginfo_sx, ginfo_sy, 12
+	stop
+	return
+
+// mod_regexp.as の中身 (mod_netincludeモジュール内で完結するようにコピペしてローカル化)
+oReg=0
+oMatches=0
+#deffunc local _endregexp onexit
+	if vartype(oReg) == 6 : delcom oReg
+	return
+#deffunc local _startregexp
+	newcom oReg,"VBScript.RegExp"
+	return
+#defcfunc local match str target,str Pattern,int IgnoreCase,int Multiline
+	oReg("Global") = 0
+	oReg("IgnoreCase") = (IgnoreCase==0)
+	oReg("Multiline") = (Multiline==0)
+	oReg("Pattern") = Pattern
+	comres oMatches
+	oReg->"Execute" target
+	if stat<0:return ""
+	if oMatches("count"){
+		oMatch=oMatches("item",0)
+		retstr=oMatch("value")
+		delcom oMatch
+	}else{
+		retstr=""
+	}
+	delcom oMatches
+	return retstr
+#defcfunc local submatch str target,str Pattern,int IgnoreCase,int Multiline
+	oReg("Global") = 0
+	oReg("IgnoreCase") = (IgnoreCase==0)
+	oReg("Multiline") = (Multiline==0)
+	oReg("Pattern") = Pattern
+	comres oMatches
+	oReg->"Execute" target
+	if stat<0 : return ""
+	retstr=""
+	if oMatches("count"){
+		oMatch=oMatches("item",0)
+		oSubmatches=oMatch("submatches")
+		if oSubmatches("count"){
+			variant=oSubmatches(".Item",0)
+			variant("vartype")=8/*VT_BSTR*/
+			retstr=variant("value")
+			variant=0
+		}
+		delcom oSubmatches
+		delcom oMatch
+	}
+	delcom oMatches
+	return retstr
+#deffunc local matches array retvar,str target,str Pattern,int IgnoreCase,int Global,int Multiline
+	oReg("IgnoreCase") = (IgnoreCase==0)
+	oReg("Global") = (Global==0)
+	oReg("Multiline") = (Multiline==0)
+	oReg("Pattern") = Pattern
+	comres oMatches
+	oReg->"Execute" target
+	if stat<0:sdim retvar,1,1:return 0
+	num1=oMatches("count")
+	if num1==0:sdim retvar,1,1:	delcom oMatches:return 0
+	oMatch=oMatches("item",0)
+	oSubmatches=oMatch("submatches")
+	num2=oSubmatches("Count")
+	sdim retvar,64,num1,num2+1
+	for i,0,num1,1
+		oMatch=oMatches("item",i)
+		retvar.i=oMatch("value")
+		oSubmatches=oMatch("submatches")
+		repeat num2
+			variant=oSubmatches(".Item",cnt)
+			variant("vartype")=8/*VT_BSTR*/
+			retvar(i,cnt+1)=variant("value")
+		loop
+	next
+	variant=0
+	delcom oSubmatches
+	delcom oMatch
+	delcom oMatches
+	return num1
+#defcfunc local replace str target,str Pattern,str repstr,int IgnoreCase,int Global,int Multiline
+	oReg("IgnoreCase") = (IgnoreCase==0)
+	oReg("Global") = (Global==0)
+	oReg("Multiline") = (Multiline==0)
+	oReg("Pattern") = Pattern
+	comres retstr
+	oReg->"Replace" target,repstr
+	if stat<0:return target
+	return retstr
+#global
+	execute@mod_netinclude
+
+#else  ; ifdef _debug
+
+;実行ファイル作成時はただの #include になる
+#define netinclude(%1,%2=0,%3=0,%4=0) include %1
+#define netuselib(%1,%2=0) uselib %1
+
+#endif  ; ifdef _debug
+#endif  ; ifndef __mod_netinclude__
+
+
+/* // hs ファイル // ///////////////////////////////////////////////////////////
+
+%type
+拡張命令
+%note
+mod_netinclude.hspをインクルードすること。
+%url
+https://github.com/MIZUSHIKI/HSP-Module
+%port
+Win
+
+
+%index
+#netinclude
+インターネットを使用してGitHubからモジュールをダウンロード
+
+%prm
+"module_name"/,p1,p2,p3
+"module_name"/ : "モジュール名文字列"/
+p1(省略可) : globalキーワード
+p2(省略可) : ネットページ抽出用 "正規表現文字列"
+p3(省略可) : NKF変換/HTMLデコード オプション
+
+%inst
+p1で指定したモジュールがカレントフォルダに存在しない場合、GitHubからダウンロードします。
+すでにモジュールがダウンロードされている場合は#includeされます。
+p1モジュール名文字列の末尾には必ず / (スラッシュ) を記述してください。
+
+HSP3NetModulesデータベースに登録してあるモジュールはGitHubのURLの一部を省略して「net/」と書くことで利用できます。
+html{
+<pre style="background-color: #F0F0F0;">
+#netinclude "net/ObjPosMod.hsp"/
+</pre>
+}html
+
+HSP3NetModulesデータベースに登録されていないものもリポジトリ名まで入力することでダウンロードできます。
+html{
+<pre style="background-color: #F0F0F0;">
+#netinclude "MIZUSHIKI/HSP-Module/master/ObjPosMod.hsp"/
+</pre>
+}html
+(https://raw.githubusercontent.com/MIZUSHIKI/HSP-Module/master/ObjPosMod.hsp : GitHub-RawファイルURL)
+
+HSP3NetModulesデータベースに何が登録されているかは netinclude_GetData で確認できます。
+また、netinclude_PostModule命令で誰でも自由にデータベースにモジュールを登録することが可能です。
+
+p1に『global』(『g』のみでも良い)と記述するとカレントフォルダでなくcommonフォルダにモジュールをダウンロードします。
+
+また、"モジュール名文字列"にネットのページを指定することができます。
+さらに、p2に"正規表現文字列"を指定することでページの一部を切り出してファイルとして保存、そのまま利用することが出来ます。
+・『https://』の「:」はファイル名に使えないので『https/』に置き換えてください。
+・「?」はファイル名に使えないので大文字の「？」に置き換えてください。
+・URL末尾に「#/モジュールファイル名」と書くのがオススメです。
+
+【 例 】
+html{
+<pre style="background-color: #F0F0F0;">
+#netinclude "https/suwa.pupu.jp/HSP/modules/mod_HighDpi_kakkokari.hsp"/
+</pre>
+}html
+
+html{
+<pre style="background-color: #F0F0F0;">
+#netinclude "http/hsp.tv/play/pforum.php？mode=pastwch&num=18983#/sample_PreventMultiple.hsp"/, , "&lt;pre(?![\s\S]*&lt;pre[\s\S]*?WM_USER_DUPEXEC[\s\S]*?&lt;/pre)>([\s\S]*?WM_USER_DUPEXEC[\s\S]*?)&lt;/pre", "EsD"
+</pre>
+}html
+
+p3オプションは nkfcnv のオプション値と同じものです。文字コードの指定が必要な場合に使用してください。
+隠しオプションとして "D" を指定することができ以下の処理が実行されます。
+・<br>の改行化
+・HTMLタグの除去
+・HTMLエンティティ(#quot;等)の展開
+
+p2正規表現のカンマ前にのみ改行を入れられます。文頭に「;」か「//」を入れてコメントアウトしてください。コメントになっていても netinclude はこの行を認識/処理しています。
+html{
+<pre style="background-color: #F0F0F0;">
+#netinclude "http/hsp.tv/play/pforum.php？mode=pastwch&num=18983#/sample_PreventMultiple.hsp"/,
+&#059; , "&lt;pre(?![\s\S]*&lt;pre[\s\S]*?WM_USER_DUPEXEC[\s\S]*?&lt;/pre)>([\s\S]*?WM_USER_DUPEXEC[\s\S]*?)&lt;/pre", "EsD"
+</pre>
+}html
+
+"モジュール名文字列"ではzip等の圧縮ファイルとその中のモジュールを指定することもできます。
+・「!/」の手前にzipのURL、後ろにzip内のモジュールファイルまでのパスを書いてください。
+・zipがダウンロード、展開されます。展開したフォルダ名称は「～.zip!」になります。
+
+【 例 】
+html{
+<pre style="background-color: #F0F0F0;">
+#netinclude "https/suwa.pupu.jp/data/ObjectPosModule_v20.zip!/ObjPosMod.hsp"/
+</pre>
+}html
+
+
+※ 注意点
+html{
+<ul>
+<li>#netinclude はHSP実行(F5)を開始するメインスクリプト上でしか動きません。</li>
+<li>#netincludeを使用するとメインスクリプト内で複数行コメントアウトが使用できなくなります。（抜け道裏技あり）</li>
+</ul>
+}html
+
+%sample
+#include "mod_netinclude.hsp"
+
+#netinclude "net/ObjPosMod.hsp"/
+
+//【下記は裏技】#netinclude後に、この2行があれば複数行コメントが使えるようになります（「* /」の真ん中の空白は消してコメントアウト末尾の形に直してください）
+#undef  netinclude* /
+#ifndef netinclude
+
+%href
+#netuselib
+netinclude_GetData
+netinclude_PostModule
+netinclude_DeleteModule
+
+%group
+プログラム制御命令
+
+
+%index
+#netuselib
+インターネットを使用してGitHubからdllをダウンロード
+
+%prm
+"dll_name",p1
+"dll_name" : "dll名文字列"
+p1(省略可) : globalキーワード
+
+%inst
+p1で指定したdllがカレントフォルダに存在しない場合、GitHubからダウンロードします。
+すでにdllがダウンロードされている場合は#uselibされます。
+(dllの取得先記述のために#uselibを利用しています。本来モジュールだけ#includeすれば良い場合は不必要な#uselibがされますがそれ自体に意味はありません。)
+
+カレントフォルダ以下の"dll名文字列"で記述したパス先にdllが保存され、カレントディレクトリにもdllがコピーされます。
+
+HSP3NetModulesデータベースに登録してあるdllはGitHubのURLの一部を省略して「net/」と書くことで利用ができます。
+html{
+<pre style="background-color: #F0F0F0;">
+#netuselib "net/sayhello.dll"/
+</pre>
+}html
+
+HSP3NetModulesデータベースに登録されていないものもリポジトリ名まで入力することでダウンロードできます。
+html{
+<pre style="background-color: #F0F0F0;">
+#netuselib "MIZUSHIKI/HSP-Module/master/sayhello.dll"/
+</pre>
+}html
+(https://raw.githubusercontent.com/MIZUSHIKI/HSP-Module/master/sayhello.dll : GitHub-RawファイルURL)
+(https://github.com/MIZUSHIKI/HSP-Module/raw/master/sayhello.dll : GitHubファイルURL)
+
+HSP3NetModulesデータベースに何が登録されているかは netinclude_GetData で取得できます。
+また、netinclude_PostModule命令で誰でも自由にデータベースにdllのURL先を登録することができます。
+(#netuselibのためのデータも同じデータベースに登録されています。)
+
+p1に『global』(『g』のみでも良い)と記述するとカレントフォルダでなくcommonフォルダにdllがダウンロードされ、HSP3インストールフォルダにもコピーされます。
+(本来dllはcommonに保存される必要はありません。何をインストールしたかの目印として扱ってください。)
+
+また、dllがそのままネット上に置いてあれば"dll名文字列"にURLを直接指定して取得することも出来ます。
+・『https://』の「:」はファイル名に使えないので『https/』に置き換えてください。
+
+【 例 】
+html{
+<pre style="background-color: #F0F0F0;">
+#netuselib "https/suwa.pupu.jp/HSP/modules/sayhello.dll"/
+</pre>
+}html
+
+"dll名文字列"ではzip等の圧縮ファイルとその中のモジュールを指定することもできます。
+・「!/」の手前にzipのURL、後ろにzip内のモジュールファイルまでのパスを書いてください。
+・zipがダウンロード、展開されます。展開したフォルダ名称は「～.zip!」になります。
+
+【 例 】
+html{
+<pre style="background-color: #F0F0F0;">
+#netuselib "https/suwa.pupu.jp/HSP/modules/sayhello.zip!/sayhello.dll"
+#netinclude "https/suwa.pupu.jp/HSP/modules/sayhello.zip!/sayhello.as"/
+
+sdim a, 128
+SayHello "わーるど", a, 128
+mes a
+</pre>
+}html
+
+
+%sample
+#include "mod_netinclude.hsp"
+
+#netuselib "net/sayhello.dll"
+#netinclude "net/sayhello.as"/
+
+sdim a, 128
+SayHello "わーるど", a, 128
+mes a
+
+%href
+#netinclude
+netinclude_GetData
+netinclude_PostModule
+netinclude_DeleteModule
+
+%group
+プログラム制御命令
+
+%index
+netinclude_GetData
+HSP3NetModulesデータベースに登録されているモジュール情報を表示
+
+%prm
+
+%inst
+HSP3NetModulesデータベースに登録されているモジュール情報をダウンロードして画面に表示
+スクリプトはこの行でstopされます。
+
+#netuselibで使用するデータも同じデータベースで管理しています。
+こちらのコマンドを使いデータを取得してください。
+
+%sample
+#include "mod_netinclude.hsp"
+
+netinclude_GetData
+
+%href
+#netinclude
+#netuselib
+netinclude_PostModule
+netinclude_DeleteModule
+
+%group
+プログラム制御命令
+
+%index
+netinclude_PostModule
+HSP3NetModulesデータベースにモジュール情報を登録
+
+%prm
+"GitHub_URL/module_name"
+"GitHub_URL/module_name" : "GitHubのURLを含めたモジュール名文字列"
+
+%inst
+HSP3NetModulesデータベースにモジュール情報を登録します。
+
+例えば、GitHubのRawファイルURLが
+https://raw.githubusercontent.com/MIZUSHIKI/HSP-Module/master/SAMPLE/FloppyWord.hsp
+の場合、
+html{
+<pre style="background-color: #F0F0F0;">
+netinclude_PostModule "MIZUSHIKI/HSP-Module/master/SAMPLE/FloppyWord.hsp"
+</pre>
+}html
+で登録すると末尾の「FloppyWord.hsp」がモジュール名データとして登録され、「MIZUSHIKI/HSP-Module/master/SAMPLE/」までが省略対象とされます。
+上記の場合、
+html{
+<pre style="background-color: #F0F0F0;">
+#netinclude "net/FloppyWord.hsp"/
+</pre>
+}html
+でダウンロードさせることができます。
+
+この登録するモジュール名(省略する部分)は、二重のスラッシュを記述することで制御できます。
+例えば、
+html{
+<pre style="background-color: #F0F0F0;">
+netinclude_PostModule "MIZUSHIKI/HSP-Module/master//SAMPLE/FloppyWord.hsp"
+</pre>
+}html
+とした場合は「SAMPLE/FloppyWord.hsp」がモジュール名データとして登録され、「MIZUSHIKI/HSP-Module/master/」までが省略対象となり、
+html{
+<pre style="background-color: #F0F0F0;">
+#netinclude "net/SAMPLE/FloppyWord.hsp"/
+</pre>
+}html
+でダウンロードさせることができます。
+
+#netuselibで使用するデータも同じデータベースで管理しています。
+こちらのコマンドを使いデータを登録してください。
+
+・GitHubに置いてあるファイルのみ登録できます。
+・登録できる拡張子は as, hsp, dll, hpi の4種類です。
+
+%sample
+#include "mod_netinclude.hsp"
+
+netinclude_PostModule "MIZUSHIKI/HSP-Module/master/mod_netinclude.hsp"
+//登録に成功するとレポート画面に「success」と表示されます。
+
+%href
+#netinclude
+#netuselib
+netinclude_GetData
+netinclude_DeleteModule
+
+%group
+プログラム制御命令
+
+%index
+netinclude_DeleteModule
+HSP3NetModulesデータベースからモジュール情報を削除
+
+%prm
+"GitHub_URL/module_name"
+"GitHub_URL/module_name" : "GitHubのURLを含めたモジュール名文字列"
+
+%inst
+HSP3NetModulesデータベースからモジュール情報を削除します。
+ただし、netinclude_DeleteModuleを実行する前にGitHub内の該当するモジュールを削除する必要があります。
+
+もしくは、モジュールが置いてあるリポジトリの説明欄(About項目のDescription)に一時的に「netinclude_DELETE=モジュール名」と書いて、netinclude_DeleteModuleを実行することでも削除することができます。
+
+これらの条件が付いているのは、いたずら目的等で勝手にデータベースから情報を削除されてしまうことを防ぐためです。
+
+#netuselibで使用するデータも同じデータベースで管理しています。
+こちらのコマンドを使いデータを削除してください。
+
+%sample
+#include "mod_netinclude.hsp"
+
+netinclude_DeleteModule "MIZUSHIKI/HSP-Module/master/mod_netinclude.hsp"
+//削除に成功するとレポート画面に「success」と表示されます。
+
+%href
+#netinclude
+#netuselib
+netinclude_GetData
+netinclude_PostModule
+
+%group
+プログラム制御命令
+
+*/ // hs ファイル // ///////////////////////////////////////////////////////////
